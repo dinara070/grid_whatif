@@ -864,12 +864,14 @@ def fault_report(P, elements):
     for g in res["gf"]:
         cap = gf_cap(topo_f, g)
         i_sc = 1.2 * cap / (math.sqrt(3) * 10.0) * 1000
-        i_ld = res["final"]["i_src_a"].get(g, None)
-        pg, qg = fin["p_src"].get(g, 0.0), fin["q_src"].get(g, 0.0)
+        src_dict = fin.get("i_src_a", {}) if fin else {}
+        i_ld = src_dict.get(g, None)
+        pg = fin.get("p_src", {}).get(g, 0.0) if fin else 0.0
+        qg = fin.get("q_src", {}).get(g, 0.0) if fin else 0.0
         i_load = math.hypot(pg, qg) / (math.sqrt(3) * 10.0) * 1000
         min_msz = min(s["i_msz"] for s in feeders.values())
         isl.append(dict(g=g, i_sc=i_sc, i_load=i_load, min_msz=min_msz))
-    return pd.DataFrame(rows), pd.DataFrame(post_rows), pd.DataFrame(in_rows), isl
+    return pd.DataFrame(rows), pd.DataFrame(post_rows), pd.DataFrame(in_df), isl
 
 
 # ════════════════════════════════════════════════════════════════════════════
