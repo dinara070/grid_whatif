@@ -1,8 +1,7 @@
 streamlit
+pandapower>=3.1
+pandas<3
 numpy
-pandas
 networkx
 plotly
 scikit-learn
-pandapower
-scipy
