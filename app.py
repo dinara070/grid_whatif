@@ -1173,7 +1173,7 @@ with tab1:
     if not sel:
         st.info("Оберіть хоча б один елемент.")
     else:
-        res = solve_c(P, tuple(sel))
+        res = dict(solve_c(P, tuple(sel)))
         res["pv_on"] = bool(der)
         fin = res["final"]
         c = st.columns(5)
