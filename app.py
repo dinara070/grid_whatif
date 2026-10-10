@@ -16,6 +16,9 @@
 кандидатів (перемички, ГОП, острівний режим). Усі показники, які бачить користувач, та
 перевірка допустимості й доведення режиму виконуються pandapower (Newton-Raphson).
 Дані синтетичні (демо).
+
+ВАЖЛИВО: у requirements.txt має бути  pandas<3  (pandapower < 3.2 несумісний з pandas 3.x,
+runpp падає з "assignment destination is read-only").
 """
 import copy
 import logging
@@ -289,14 +292,15 @@ def apply_state(net, p, topo, closed, f_nodes, f_edges, scale, shed, shed_pv, gf
 def pp_state(net, p, topo, closed, f_nodes, f_edges, scale, shed, shed_pv, gf):
     """Справжній розрахунок режиму (pandapower, Newton-Raphson) -> узагальнений стан."""
     apply_state(net, p, topo, closed, f_nodes, f_edges, scale, shed, shed_pv, gf)
-    out = dict(conv=True, vm={}, ratio={}, i_a={}, p_from={}, q_from={}, pl_kw={}, pflow_down={},
+    out = dict(conv=True, err="", vm={}, ratio={}, i_a={}, p_from={}, q_from={}, pl_kw={}, pflow_down={},
                src={}, p_src={}, q_src={}, i_src_a={}, losses=0.0, pv_mw=0.0, bess_mw=0.0)
     if not topo["order"]:
         return out
     try:
         pp.runpp(net, numba=False, init="flat", calculate_voltage_angles=False, max_iteration=40)
-    except Exception:                               # noqa: BLE001
+    except Exception as ex:                         # noqa: BLE001
         out["conv"] = False
+        out["err"] = f"{type(ex).__name__}: {ex}"
         return out
     rb, rl = net.res_bus, net.res_line
     for n, b in MAPS["bus"].items():
@@ -707,8 +711,9 @@ def daily_profile(P):
             vms = [v for n, v in stt["vm"].items() if NODES[n]["type"] == "tp"]
             rows.append(dict(h=h, case=tag, load=sum(NODES[n]["load"] for n in TPS) * load_scale(p),
                              pv=stt["pv_mw"], bess=stt["bess_mw"], imp=sum(stt["p_src"].get(s, 0) for s in SOURCES),
-                             losses=stt["losses"], vmin=min(vms), vmax=max(vms),
-                             max_line=max(stt["ratio"].values())))
+                             losses=stt["losses"], vmin=min(vms) if vms else float("nan"),
+                             vmax=max(vms) if vms else float("nan"),
+                             max_line=max(stt["ratio"].values()) if stt["ratio"] else 0.0))
     return pd.DataFrame(rows)
 
 
@@ -742,6 +747,10 @@ def protection_settings(P):
     net = new_net(p)
     topo = topology(set(CLOSED0), E0, E0)
     stt = pp_state(net, p, topo, set(CLOSED0), E0, E0, load_scale(p), set(), set(), ())
+    if not stt["conv"]:
+        raise RuntimeError("Power Flow не зійшовся при розрахунку уставок: "
+                           + (stt.get("err") or "невідома помилка")
+                           + ". Перевірте, що встановлено pandas<3 (див. requirements.txt).")
     net.sgen["in_service"] = False
     net.ext_grid.loc[list(MAPS["slack"].values()), "in_service"] = False
     heads = [eid for eid in CLOSED0 if EDGES[eid]["u"] in SOURCES]
@@ -864,14 +873,12 @@ def fault_report(P, elements):
     for g in res["gf"]:
         cap = gf_cap(topo_f, g)
         i_sc = 1.2 * cap / (math.sqrt(3) * 10.0) * 1000
-        src_dict = fin.get("i_src_a", {}) if fin else {}
-        i_ld = src_dict.get(g, None)
         pg = fin.get("p_src", {}).get(g, 0.0) if fin else 0.0
         qg = fin.get("q_src", {}).get(g, 0.0) if fin else 0.0
         i_load = math.hypot(pg, qg) / (math.sqrt(3) * 10.0) * 1000
         min_msz = min(s["i_msz"] for s in feeders.values())
         isl.append(dict(g=g, i_sc=i_sc, i_load=i_load, min_msz=min_msz))
-    return pd.DataFrame(rows), pd.DataFrame(post_rows), pd.DataFrame(in_df), isl
+    return pd.DataFrame(rows), pd.DataFrame(post_rows), pd.DataFrame(in_rows), isl
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1097,7 +1104,7 @@ def registry_features(P, growth, winter_days):
         if r["kind"] == "tp":
             nominal.append(NODES[r["id"]]["load"] / (NODES[r["id"]]["kva"] * 0.95 / 1000))
         elif r["kind"] == "ps":
-            nominal.append(stt["src"][r["id"]])
+            nominal.append(stt["src"].get(r["id"], 0.0))
         else:
             nominal.append(stt["ratio"].get(r["id"], 0.0))
     peak = np.array(nominal) * temp_factor(p0.temp, p0.sens) * (1 + growth)
@@ -1161,6 +1168,15 @@ P = (float(temp), int(hour), float(sens), float(src_cap), tol / 100.0, float(t_d
      float(repair_h), float(vmin), float(vmax), float(u_ps), float(cosphi), int(der), float(pv_k), float(ins),
      0 if bess_mode_txt.startswith("Резерв") else 1, soc / 100.0, int(island))
 PP = Params(*P)
+
+# --- діагностика: якщо Power Flow не рахується (наприклад, несумісні версії pandas/pandapower) ---
+_chk = pp_state(new_net(PP), PP, topology(set(CLOSED0), E0, E0), set(CLOSED0), E0, E0,
+                load_scale(PP), set(), set(), ())
+if not _chk["conv"]:
+    st.error("⚠️ Power Flow (pandapower) не вдалося виконати: "
+             f"`{_chk['err'] or 'не зійшовся'}`. Якщо в тексті є «read-only», додайте у requirements.txt "
+             "рядок `pandas<3` (або оновіть pandapower) і перезапустіть застосунок.")
+    st.stop()
 
 tabs = st.tabs(["🔥 Сценарний симулятор", "⚡ КЗ та релейний захист", "☀️ ВДЕ та добовий режим",
                 "📚 Бібліотека протоколів N-1", "🔮 Прогноз відмов", "⚖️ Ризик = P × наслідки"])
