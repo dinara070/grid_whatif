@@ -1,7 +1,11 @@
-streamlit
+streamlit>=1.37
 pandapower>=3.1
 pandas<3
 numpy
 networkx
 plotly
 scikit-learn
+lightgbm
+shap
+matplotlib
+paho-mqtt>=2.0
