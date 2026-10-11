@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Цифровий двійник розподільчої мережі 10 кВ (v2: pandapower + ВДЕ/АБ + КЗ)
+Цифровий двійник розподільчої мережі 10 кВ - Вінницька область
+(v3: pandapower + ВДЕ/АБ + КЗ + ML-прогноз + SHAP + телеметрія)
+
+Регіональна прив'язка: райони області з реальними координатами (карта OpenStreetMap), погода та сонячна
+радіація Open-Meteo для обраного району, огляд усієї області. Електрична мережа УМОВНА (синтетична):
+це типова схема 2 ПС 110/10 кВ + 4 фідери, а не реальні об'єкти й параметри обленерго.
 
   1) Сценарний симулятор «Що, якщо?» (N-1 / N-k) із реальним розрахунком режимів pandapower:
      P, Q, напруги у вузлах, втрати, завантаження ліній і трансформаторів ПС.
@@ -34,7 +39,7 @@ import urllib.parse
 import urllib.request
 import warnings
 from collections import defaultdict, deque, namedtuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import networkx as nx
@@ -76,7 +81,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("pandapower").setLevel(logging.ERROR)
 
 st.set_page_config(
-    page_title="Цифровий двійник РЕМ: Power Flow, ВДЕ, КЗ, Predictive Maintenance",
+    page_title="Цифровий двійник мережі 10 кВ: Вінницька область",
     page_icon="⚡",
     layout="wide",
 )
@@ -93,7 +98,7 @@ SOC_FLOOR, BESS_EFF = 0.10, 0.92
 Params = namedtuple(
     "Params",
     "temp hour sens src_cap tol t_detect t_switch repair_h vmin vmax u_ps cosphi "
-    "der pv_k ins bess_mode soc island prof")
+    "der pv_k ins bess_mode soc island prof pvp")
 
 PV_DEF = {"ТП-102": 0.5, "ТП-105": 0.4, "ТП-203": 0.6, "ТП-302": 0.5, "ТП-404": 0.5, "ТП-405": 0.7}
 BESS_DEF = {"ТП-104": (1.0, 2.0), "ТП-304": (1.2, 2.4), "ТП-404": (1.5, 3.0)}   # МВт, МВт·год
@@ -149,6 +154,46 @@ CLOSED0 = frozenset(e for e, d in EDGES.items() if not d["tie"])
 ALL_ELEMS = SOURCES + TPS + [e for e, d in EDGES.items() if not d["tie"]]
 E0 = frozenset()
 
+# ── Вінницька область: райони (центри умовної типової мережі) та географія ──
+# Координати - наближені центри міст. Мережа в застосунку УМОВНА (синтетична), а не реальна схема обленерго.
+DISTRICTS = {
+    "Вінниця": dict(lat=49.2331, lon=28.4682),
+    "Жмеринка": dict(lat=49.0354, lon=28.1147),
+    "Хмільник": dict(lat=49.5560, lon=27.9710),
+    "Козятин": dict(lat=49.7150, lon=28.8340),
+    "Гайсин": dict(lat=48.8097, lon=29.3897),
+    "Тульчин": dict(lat=48.6720, lon=28.8480),
+    "Могилів-Подільський": dict(lat=48.4455, lon=27.7870),
+    "Бершадь": dict(lat=48.3650, lon=29.5230),
+}
+OBLAST_CENTER = (49.0, 28.6)
+GEO_KM = 1.4                                         # км на одну умовну одиницю схеми
+
+# Типи споживачів (умовні) за категорією надійності: 1 - критичні, 2 - звичайні, 3 - обмежувані
+CTYPES = {1: ["Лікарня", "Водозабір/КНС", "Котельня", "Пункт незламності"],
+          2: ["Житловий сектор", "Школа/ліцей", "Адмінбудівля/ЦНАП"],
+          3: ["Агропідприємство", "Переробне підприємство", "Торговий центр", "Склад/логістика"]}
+for _n in TPS:                                       # окремий генератор: не зміщує основний rng мережі
+    _r = np.random.default_rng(1000 + int(_n.split("-")[1]))
+    NODES[_n]["ctype"] = str(_r.choice(CTYPES[NODES[_n]["prio"]]))
+for _n in SOURCES:
+    NODES[_n]["ctype"] = "Підстанція 110/10 кВ"
+
+
+def _now_local():
+    """Поточний час у Києві (naive Timestamp); запасний варіант без tzdata: UTC+3."""
+    try:
+        return pd.Timestamp(datetime.now(ZoneInfo("Europe/Kyiv")).replace(tzinfo=None))
+    except Exception:                                # noqa: BLE001
+        return pd.Timestamp((datetime.now(timezone.utc) + timedelta(hours=3)).replace(tzinfo=None))
+
+
+def node_lonlat(n, center):
+    lat0, lon0 = center
+    d = NODES[n]
+    return (lon0 + d["x"] * GEO_KM / (111.32 * math.cos(math.radians(lat0))),
+            lat0 + d["y"] * GEO_KM / 110.57)
+
 
 def elem_type(e):
     if e in NODES:
@@ -174,6 +219,13 @@ def load_scale(p):
 def pv_profile(h):
     """Зимова добова крива PV (частка від встановленої потужності, ясно)."""
     return max(0.0, math.sin(math.pi * (h - 7.5) / 9.5)) * 0.7 if 7.5 < h < 17 else 0.0
+
+
+def pv_frac(p):
+    """Частка встановленої потужності PV: з прогнозу радіації (p.pvp) або типова крива × інсоляція."""
+    if p.pvp:
+        return p.pvp[int(p.hour)]
+    return pv_profile(p.hour) * p.ins / 100.0
 
 
 def bess_frac(h, mode, soc):
@@ -239,7 +291,7 @@ def pv_mw_node(n, p, topo, shed_pv, f_nodes):
         return 0.0
     if topo["root"][n] not in SOURCES and not p.island:      # антиострівний захист інверторів
         return 0.0
-    return d["pv"] * p.pv_k * pv_profile(p.hour) * p.ins / 100.0
+    return d["pv"] * p.pv_k * pv_frac(p)
 
 
 def bess_mw_node(n, p, topo, f_nodes):
@@ -606,7 +658,7 @@ def solve(P, elements):
             _, _, _, ident, kind, closed_n, gf_n, sh2, pv2, s2 = best
             for n in sorted(sh2 - shed):
                 add("shed", "Відключити ТП (графік обмежень, ГОП)", n,
-                    f"Усунення порушень режиму; пріоритет {PRIO_TXT[NODES[n]['prio']]}, "
+                    f"Усунення порушень режиму; {NODES[n]['ctype']}, пріоритет {PRIO_TXT[NODES[n]['prio']]}, "
                     f"{NODES[n]['load'] * scale:.2f} МВт")
             for n in sorted(pv2 - shed_pv):
                 add("pv", "Обмежити генерацію PV", n, "Усунення перенапруги/зворотного перевантаження")
@@ -641,7 +693,7 @@ def solve(P, elements):
         if fix[0] == "load":
             shed.add(fix[1])
             add("shed", "Відключити ТП (ГОП за результатом Power Flow)", fix[1],
-                f"Порушення за розрахунком pandapower; пріоритет {PRIO_TXT[NODES[fix[1]]['prio']]}, "
+                f"Порушення за розрахунком pandapower; {NODES[fix[1]]['ctype']}, пріоритет {PRIO_TXT[NODES[fix[1]]['prio']]}, "
                 f"{NODES[fix[1]]['load'] * scale:.2f} МВт")
         else:
             shed_pv.add(fix[1])
@@ -733,7 +785,7 @@ def scan_all(P):
 
 @st.cache_data(show_spinner="Побудова карти чутливості…")
 def sens_grid(P, elements, hours, temps):
-    return [[solve((float(t), int(h)) + tuple(P[2:-1]) + ((),), elements)["unsup_mw"] for h in hours]
+    return [[solve((float(t), int(h)) + tuple(P[2:-2]) + ((), ()), elements)["unsup_mw"] for h in hours]
             for t in temps]
 
 
@@ -782,7 +834,7 @@ def head_of(topo, node):
 
 @st.cache_data(show_spinner="Розрахунок уставок захисту…")
 def protection_settings(P):
-    p = Params(*P)._replace(temp=-20.0, hour=18, der=0, prof=())
+    p = Params(*P)._replace(temp=-20.0, hour=18, der=0, prof=(), pvp=())
     net = new_net(p)
     topo = topology(set(CLOSED0), E0, E0)
     stt = pp_state(net, p, topo, set(CLOSED0), E0, E0, load_scale(p), set(), set(), ())
@@ -980,7 +1032,7 @@ def draw_map(res, phase, color_by):
         v = stt["vm"].get(n)
         return (f"{n}<br>{label}<br>Навантаження: {NODES[n]['load'] * res['scale']:.2f} МВт"
                 f"<br>Напруга: {('%.3f о.е. (%.2f кВ)' % (v, v * 10)) if v else '—'}"
-                f"<br>Споживачів: {NODES[n]['cons']}<br>Пріоритет: {PRIO_TXT[NODES[n]['prio']]}")
+                f"<br>Споживач: {NODES[n]['ctype']}<br>Споживачів: {NODES[n]['cons']}<br>Пріоритет: {PRIO_TXT[NODES[n]['prio']]}")
 
     if color_by == "Напруга":
         en = [n for n in TPS if status[n] in ("ok", "restored", "island") and n in stt["vm"]]
@@ -1028,6 +1080,105 @@ def draw_map(res, phase, color_by):
     fig.update_layout(height=540, margin=dict(l=10, r=10, t=10, b=10), xaxis=dict(visible=False),
                       yaxis=dict(visible=False, scaleanchor="x"), legend=dict(orientation="h", y=-0.05),
                       plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+
+def _map_cls():
+    """plotly >= 5.24: Scattermap (layout.map); старіші версії: Scattermapbox (layout.mapbox)."""
+    if hasattr(go, "Scattermap"):
+        return go.Scattermap, "map"
+    return go.Scattermapbox, "mapbox"
+
+
+def _dashed(lon1, lat1, lon2, lat2, n=9):
+    xs, ys = [], []
+    for i in range(0, n, 2):
+        a, b = i / n, min((i + 1) / n, 1.0)
+        xs += [lon1 + (lon2 - lon1) * a, lon1 + (lon2 - lon1) * b, None]
+        ys += [lat1 + (lat2 - lat1) * a, lat1 + (lat2 - lat1) * b, None]
+    return xs, ys
+
+
+def hover_txt(n, label, stt, scale):
+    v = stt["vm"].get(n)
+    return (f"{n} · {NODES[n]['ctype']}<br>{label}<br>Навантаження: {NODES[n]['load'] * scale:.2f} МВт"
+            f"<br>Напруга: {('%.3f о.е. (%.2f кВ)' % (v, v * 10)) if v else '—'}"
+            f"<br>Споживачів: {NODES[n]['cons']}<br>Пріоритет: {PRIO_TXT[NODES[n]['prio']]}")
+
+
+def draw_geo_map(res, phase, color_by, center, district):
+    """Та сама мережа, але на карті OpenStreetMap навколо обраного району Вінницької області."""
+    Sc, mkey = _map_cls()
+    stt, closed, status, topo = phase_data(res, phase)
+    fig = go.Figure()
+    pos = {n: node_lonlat(n, center) for n in NODES}
+    mlon, mlat, mt = [], [], []
+    for eid, e in EDGES.items():
+        (x1, y1), (x2, y2) = pos[e["u"]], pos[e["v"]]
+        r = stt["ratio"].get(eid)
+        dash = False
+        if eid in res["f_edges"]:
+            color, w, txt = "#000000", 6, f"{eid}<br>ПОШКОДЖЕНО"
+        elif eid not in closed:
+            color, w, dash = "#616161", 3, True
+            txt = f"{eid}<br>Розімкнена перемичка (ліміт {e['imax'] * 1000:.0f} А)"
+        elif r is None:
+            color, w, txt = "#bdbdbd", 3, f"{eid}<br>Без напруги"
+        else:
+            color, w = ratio_color(r), 3 + 4 * min(r, 1.2)
+            txt = (f"{eid}<br>P={stt['p_from'][eid]:+.2f} МВт, Q={stt['q_from'][eid]:+.2f} МВАр<br>"
+                   f"I={stt['i_a'][eid]:.0f} А / {e['imax'] * 1000:.0f} А ({r:.0%})<br>"
+                   f"Втрати {stt['pl_kw'][eid]:.1f} кВт")
+        xs, ys = _dashed(x1, y1, x2, y2) if dash else ([x1, x2], [y1, y2])
+        fig.add_trace(Sc(lon=xs, lat=ys, mode="lines", line=dict(color=color, width=w),
+                         hoverinfo="skip", showlegend=False))
+        mlon.append((x1 + x2) / 2)
+        mlat.append((y1 + y2) / 2)
+        mt.append(txt)
+    fig.add_trace(Sc(lon=mlon, lat=mlat, mode="markers", marker=dict(size=14, opacity=0.01),
+                     hovertext=mt, hoverinfo="text", showlegend=False))
+    if color_by == "Напруга":
+        en = [n for n in TPS if status[n] in ("ok", "restored", "island") and n in stt["vm"]]
+        if en:
+            fig.add_trace(Sc(
+                lon=[pos[n][0] for n in en], lat=[pos[n][1] for n in en], mode="markers+text",
+                text=[n.replace("ТП-", "") for n in en], textposition="top center", name="Напруга, о.е.",
+                marker=dict(size=17, color=[stt["vm"][n] for n in en], colorscale=VOLT_SCALE, cmin=0.90, cmax=1.10,
+                            colorbar=dict(title="U, о.е.", thickness=12, len=0.5)),
+                hovertext=[hover_txt(n, STATUS_STYLE[status[n]][0], stt, res["scale"]) for n in en],
+                hoverinfo="text", showlegend=False))
+        groups = ("shed", "lost", "failed")
+    else:
+        groups = tuple(STATUS_STYLE)
+    for key in groups:
+        names = [n for n in TPS if status[n] == key]
+        if not names:
+            continue
+        label, color = STATUS_STYLE[key]
+        fig.add_trace(Sc(
+            lon=[pos[n][0] for n in names], lat=[pos[n][1] for n in names], mode="markers+text", name=label,
+            text=[n.replace("ТП-", "") for n in names], textposition="top center",
+            marker=dict(size=17, color=color),
+            hovertext=[hover_txt(n, label, stt, res["scale"]) for n in names], hoverinfo="text"))
+    fig.add_trace(Sc(
+        lon=[pos[s][0] for s in SOURCES], lat=[pos[s][1] for s in SOURCES], mode="markers+text",
+        name="Джерело (ПС 110/10 кВ)", text=SOURCES, textposition="bottom center",
+        marker=dict(size=24, color=["#d32f2f" if s in res["f_nodes"] else "#6a1b9a" for s in SOURCES]),
+        hovertext=[f"{s} · умовна ПС 110/10 кВ, {district}<br>Завантаження трансформатора: "
+                   f"{stt['src'].get(s, 0):.0%}<br>P={stt['p_src'].get(s, 0):+.2f} МВт, "
+                   f"Q={stt['q_src'].get(s, 0):+.2f} МВАр" for s in SOURCES], hoverinfo="text"))
+    if res["pv_on"]:
+        pvn = [n for n in TPS if NODES[n]["pv"] > 0]
+        bn = [n for n in TPS if NODES[n]["bess_mw"] > 0]
+        fig.add_trace(Sc(lon=[pos[n][0] + 0.004 for n in pvn], lat=[pos[n][1] + 0.003 for n in pvn], mode="markers",
+                         name="PV (☀)", marker=dict(size=11, color="#ffb300"),
+                         hovertext=[f"PV {n}: {NODES[n]['pv']} МВт" for n in pvn], hoverinfo="text"))
+        fig.add_trace(Sc(lon=[pos[n][0] + 0.004 for n in bn], lat=[pos[n][1] - 0.003 for n in bn], mode="markers",
+                         name="АБ (🔋)", marker=dict(size=11, color="#00897b"),
+                         hovertext=[f"АБ {n}: {NODES[n]['bess_mw']} МВт / {NODES[n]['bess_mwh']} МВт·год"
+                                    for n in bn], hoverinfo="text"))
+    fig.update_layout(height=620, margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h", y=-0.02),
+                      **{mkey: dict(style="open-street-map", center=dict(lat=center[0], lon=center[1]), zoom=10.2)})
     return fig
 
 
@@ -1200,15 +1351,15 @@ def _om_get(url, params, timeout=8):
         return json.loads(r.read().decode("utf-8"))
 
 
-def _om_series(js):
+def _om_series(js, key="temperature_2m"):
     h = js["hourly"]
-    return pd.Series(h["temperature_2m"], index=pd.to_datetime(h["time"]), dtype=float)
+    return pd.Series(h[key], index=pd.to_datetime(h["time"]), dtype=float)
 
 
 def synth_weather(start, end, seed=3):
     """Синтетична температура (запасний варіант, якщо Open-Meteo недоступний)."""
     idx = pd.date_range(start, end, freq="h")
-    seasonal = 8.0 - 14.0 * np.cos(2 * np.pi * (idx.dayofyear.values - 15) / 365.0)
+    seasonal = 7.8 - 12.4 * np.cos(2 * np.pi * (idx.dayofyear.values - 15) / 365.0)   # клімат Вінниччини: січ ≈ -4.6, лип ≈ +20 °C
     daily = 4.0 * np.sin(2 * np.pi * (idx.hour.values - 9) / 24.0)
     rng = np.random.default_rng(seed)
     noise = np.zeros(len(idx))
@@ -1219,17 +1370,20 @@ def synth_weather(start, end, seed=3):
 
 @st.cache_data(ttl=3600, show_spinner="Завантаження погоди (Open-Meteo)…")
 def get_weather(lat, lon, day_key):
-    """Годинна температура: архів ERA5 (≈14 міс.) + прогноз на 3 доби. Повертає (ряд, джерело, часовий пояс)."""
+    """Годинна температура: архів ERA5 (≈14 міс.) + прогноз на 3 доби; сонячна радіація - лише прогноз.
+    Повертає (ряд T, джерело, часовий пояс, ряд радіації або None)."""
     today = pd.Timestamp(day_key)
+    tz = "Europe/Kyiv"
     try:
-        fcj = _om_get(OM_FC_URL, dict(latitude=lat, longitude=lon, hourly="temperature_2m",
-                                      past_days=10, forecast_days=3, timezone="auto"))
-        s_fc, tz = _om_series(fcj), fcj.get("timezone", "Europe/Kyiv")
+        fcj = _om_get(OM_FC_URL, dict(latitude=lat, longitude=lon, hourly="temperature_2m,shortwave_radiation",
+                                      past_days=10, forecast_days=3, timezone=tz))
+        s_fc = _om_series(fcj)
+        rad = _om_series(fcj, "shortwave_radiation") if "shortwave_radiation" in fcj["hourly"] else None
     except Exception as ex:                          # noqa: BLE001
         s = synth_weather(today - pd.Timedelta(days=420), today + pd.Timedelta(days=3))
-        return s, f"синтетична погода (Open-Meteo недоступний: {type(ex).__name__})", "UTC"
+        return s, f"синтетична погода (Open-Meteo недоступний: {type(ex).__name__})", tz, None
     try:
-        arj = _om_get(OM_AR_URL, dict(latitude=lat, longitude=lon, hourly="temperature_2m", timezone="auto",
+        arj = _om_get(OM_AR_URL, dict(latitude=lat, longitude=lon, hourly="temperature_2m", timezone=tz,
                                       start_date=(today - pd.Timedelta(days=420)).strftime("%Y-%m-%d"),
                                       end_date=(today - pd.Timedelta(days=11)).strftime("%Y-%m-%d")), timeout=20)
         s_ar, src = _om_series(arj), "Open-Meteo: архів ERA5 + прогноз"
@@ -1239,7 +1393,7 @@ def get_weather(lat, lon, day_key):
     s = pd.concat([s_ar, s_fc])
     s = s[~s.index.duplicated(keep="last")].sort_index()
     s = s.asfreq("h").interpolate(limit=12).ffill().bfill()
-    return s, src, tz
+    return s, src, tz, rad
 
 
 def _true_load(idx, temp):
@@ -1292,11 +1446,8 @@ def _read_hist(raw, hist_idx):
 
 @st.cache_data(ttl=3600, show_spinner="Навчання моделі прогнозу навантаження…")
 def forecast_load(lat, lon, day_key, hist_bytes=None):
-    ser, w_src, tz = get_weather(lat, lon, day_key)
-    try:
-        now_loc = pd.Timestamp(datetime.now(ZoneInfo(tz)).replace(tzinfo=None))
-    except Exception:                                # noqa: BLE001
-        now_loc = pd.Timestamp(datetime.now(ZoneInfo("UTC")).replace(tzinfo=None))
+    ser, w_src, tz, rad = get_weather(lat, lon, day_key)
+    now_loc = _now_local()
     t_idx = pd.date_range(now_loc.normalize() + pd.Timedelta(days=1), periods=24, freq="h")
     if not set(t_idx).issubset(set(ser.index)):
         raise ValueError("у погодних даних немає всіх 24 годин завтрашньої доби")
@@ -1330,7 +1481,14 @@ def forecast_load(lat, lon, day_key, hist_bytes=None):
     prof = np.clip(m.predict(Xt), 0.2, 2.5)
     stat = np.asarray(HOURLY) * (1 + 0.012 * np.maximum(0, 5 - Xt["temp"].values))
     k = min(96, len(yt))
-    return dict(
+    if rad is not None and set(t_idx).issubset(set(rad.index)):
+        pv_f = np.clip(rad.reindex(t_idx).fillna(0).values / 1000.0 * 0.85, 0, 1)     # PR ≈ 0.85
+        pv_src = "Open-Meteo: сонячна радіація (shortwave_radiation)"
+    else:
+        pv_f = np.array([pv_profile(h) for h in range(24)])
+        pv_src = "типова зимова крива (прогноз радіації недоступний)"
+    return dict(pv_frac=[float(v) for v in pv_f], pv_src=pv_src,
+                
         date=t_idx[0].strftime("%d.%m.%Y"), tz=tz, weather_src=w_src, data_src=d_src, model=name, n_train=int(len(y)),
         mae_ml=float(np.mean(np.abs(pred_te - yt))), mae_static=float(np.mean(np.abs(stat_te - yt))),
         mape_ml=float(100 * np.mean(np.abs(pred_te - yt) / np.maximum(yt, 1e-6))),
@@ -1338,6 +1496,40 @@ def forecast_load(lat, lon, day_key, hist_bytes=None):
         temps=[float(v) for v in Xt["temp"].values],
         bt=dict(ts=[t.strftime("%Y-%m-%d %H:%M") for t in y[te].index[-k:]], actual=[float(v) for v in yt[-k:]],
                 ml=[float(v) for v in pred_te[-k:]], static=[float(v) for v in stat_te[-k:]]))
+
+
+@st.cache_data(ttl=3600, show_spinner="Погода по районах області (Open-Meteo)…")
+def oblast_weather(day_key):
+    """Умови на завтра по районах: T мін/макс, пік навантаження типової мережі, потенціал PV."""
+    names = list(DISTRICTS)
+    t_idx = pd.date_range(_now_local().normalize() + pd.Timedelta(days=1), periods=24, freq="h")
+    series = []
+    try:
+        js = _om_get(OM_FC_URL, dict(latitude=",".join(str(DISTRICTS[n]["lat"]) for n in names),
+                                     longitude=",".join(str(DISTRICTS[n]["lon"]) for n in names),
+                                     hourly="temperature_2m,shortwave_radiation", forecast_days=3,
+                                     timezone="Europe/Kyiv"), timeout=15)
+        js = [js] if isinstance(js, dict) else js
+        if len(js) != len(names):
+            raise ValueError("несподівана відповідь API")
+        for j in js:
+            series.append((_om_series(j).reindex(t_idx).values,
+                           _om_series(j, "shortwave_radiation").reindex(t_idx).fillna(0).values))
+        src = "Open-Meteo"
+    except Exception as ex:                          # noqa: BLE001
+        series = []
+        base = synth_weather(t_idx[0] - pd.Timedelta(days=2), t_idx[-1] + pd.Timedelta(days=1)).reindex(t_idx).values
+        for i, n in enumerate(names):
+            off = (49.0 - DISTRICTS[n]["lat"]) * 0.6 + 0.2 * (i % 3)
+            series.append((base + off, np.array([pv_profile(h) / 0.7 * 400.0 for h in range(24)])))
+        src = f"синтетичні дані (Open-Meteo недоступний: {type(ex).__name__})"
+    rows = []
+    for n, (T, R) in zip(names, series):
+        f = np.asarray(HOURLY) * (1 + 0.012 * np.maximum(0, 5 - T))
+        rows.append(dict(district=n, lat=DISTRICTS[n]["lat"], lon=DISTRICTS[n]["lon"], tmin=float(np.nanmin(T)),
+                         tmax=float(np.nanmax(T)), peak_factor=float(f.max()), peak_mw=float(f.max() * TOTAL_BASE_MW),
+                         pv_yield=float(np.nansum(R) / 1000.0 * 0.85)))
+    return pd.DataFrame(rows), src, t_idx[0].strftime("%d.%m.%Y")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1623,18 +1815,22 @@ def live_panel(store, assets):
 # ════════════════════════════════════════════════════════════════════════════
 # 8. ІНТЕРФЕЙС
 # ════════════════════════════════════════════════════════════════════════════
-st.title("⚡ Цифровий двійник мережі 10 кВ: Power Flow, ВДЕ, КЗ та прогноз відмов")
-st.caption("Демонстраційні синтетичні дані. 2 ПС 110/10 кВ, 4 фідери, 20 ТП, 6 нормально-розімкнених перемичок, "
+st.title("⚡ Цифровий двійник мережі 10 кВ · Вінницька область")
+st.caption("Умовна (синтетична) типова мережа, розміщена в обраному районі Вінницької області - не реальні об'єкти обленерго. "
+           "2 ПС 110/10 кВ, 4 фідери, 20 ТП, 6 нормально-розімкнених перемичок, "
            "6 PV-станцій та 3 акумуляторні батареї. Режими рахує pandapower (Newton-Raphson).")
 
 with st.sidebar:
+    st.header("🗺️ Вінницька область")
+    district = st.selectbox("Район (центр умовної мережі)", list(DISTRICTS), index=0,
+                            help="Визначає розміщення мережі на карті та координати для погоди й сонячної радіації Open-Meteo")
+    lat, lon = DISTRICTS[district]["lat"], DISTRICTS[district]["lon"]
     st.header("📈 Профіль навантаження")
     prof_mode = st.radio("Джерело добового профілю", ["Статичний (HOURLY × T)", "ML-прогноз на завтра"],
-                         help="ML-режим: LightGBM + прогноз погоди Open-Meteo; година доби = година завтрашнього дня")
+                         help="ML-режим: LightGBM + прогноз температури та сонячної радіації Open-Meteo для обраного району; "
+                              "година доби = година завтрашнього дня; повзунок «Інсоляція» ігнорується")
     use_fc = prof_mode.startswith("ML")
-    with st.expander("Локація, погода та історія"):
-        lat = st.number_input("Широта, °", -90.0, 90.0, 49.04, 0.01)
-        lon = st.number_input("Довгота, °", -180.0, 180.0, 28.11, 0.01)
+    with st.expander("Історія навантаження (CSV зі SCADA)"):
         hist_up = st.file_uploader("CSV історії навантаження (ts, load_mw)", type="csv", key="hist_csv")
         hist_bytes = hist_up.getvalue() if hist_up is not None else None
     st.header("⚙️ Умови режиму")
@@ -1661,9 +1857,10 @@ with st.sidebar:
     t_switch = st.number_input("Час однієї комутації, хв", 1.0, 60.0, 4.0, 1.0)
     repair_h = st.number_input("Тривалість ремонту, год", 1.0, 72.0, 8.0, 0.5)
 
+DAY_KEY = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 FC, FC_ERR = None, ""
 try:
-    FC = forecast_load(float(lat), float(lon), datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d"), hist_bytes)
+    FC = forecast_load(float(lat), float(lon), DAY_KEY, hist_bytes)
 except Exception as ex:                             # noqa: BLE001
     FC_ERR = f"{type(ex).__name__}: {ex}"
 use_fc = bool(use_fc and FC is not None)
@@ -1673,11 +1870,11 @@ if use_fc:
 P = (float(temp), int(hour), float(sens), float(src_cap), tol / 100.0, float(t_detect), float(t_switch),
      float(repair_h), float(vmin), float(vmax), float(u_ps), float(cosphi), int(der), float(pv_k), float(ins),
      0 if bess_mode_txt.startswith("Резерв") else 1, soc / 100.0, int(island),
-     tuple(FC["profile"]) if use_fc else ())
+     tuple(FC["profile"]) if use_fc else (), tuple(FC["pv_frac"]) if use_fc else ())
 PP = Params(*P)
 with st.sidebar:
     st.caption(f"Коефіцієнт навантаження: **{load_scale(PP):.2f}** · T = **{temp:+d} °C** · "
-               f"PV зараз: **{pv_profile(hour) * ins / 100:.0%}** від встановленої.")
+               f"PV зараз: **{pv_frac(PP):.0%}** від встановленої.")
     if FC_ERR:
         st.warning(f"ML-прогноз недоступний ({FC_ERR}); використано статичний профіль.")
 
@@ -1691,9 +1888,9 @@ if not _chk["conv"]:
     st.stop()
 
 tabs = st.tabs(["🔥 Сценарний симулятор", "⚡ КЗ та релейний захист", "☀️ ВДЕ та добовий режим",
-                "📈 Прогноз навантаження", "📚 Бібліотека протоколів N-1", "📡 Телеметрія (live)",
-                "🔮 Прогноз відмов", "⚖️ Ризик = P × наслідки"])
-tab1, tab_kz, tab_der, tab_fc, tab2, tab_live, tab3, tab4 = tabs
+                "🗺️ Вінницька область", "📈 Прогноз навантаження", "📚 Бібліотека протоколів N-1",
+                "📡 Телеметрія (live)", "🔮 Прогноз відмов", "⚖️ Ризик = P × наслідки"])
+tab1, tab_kz, tab_der, tab_obl, tab_fc, tab2, tab_live, tab3, tab4 = tabs
 
 # ─────────────────────────── TAB 1: СИМУЛЯТОР ───────────────────────────
 with tab1:
@@ -1742,7 +1939,11 @@ with tab1:
         cm = st.columns([2, 1])
         phase = cm[0].radio("Стан схеми", PHASES, index=2, horizontal=True)
         color_by = cm[1].radio("Забарвлення вузлів", ["Статус", "Напруга"], horizontal=True)
-        st.plotly_chart(draw_map(res, phase, color_by), key="map")
+        view = st.radio("Вигляд", ["Карта (OpenStreetMap)", "Схема"], horizontal=True, key="view_mode")
+        if view.startswith("Карта"):
+            st.plotly_chart(draw_geo_map(res, phase, color_by, (lat, lon), district), key="geomap")
+        else:
+            st.plotly_chart(draw_map(res, phase, color_by), key="map")
         st.caption("Лінії: 🟢 <60% · 🟡 60–80% · 🟠 80–100% · 🔴 >100% від допустимого струму; пунктир сірий - "
                    "розімкнена перемичка; чорний пунктир - пошкоджено. ★ - PV, ⬢ - АБ.")
         st.plotly_chart(voltage_profile(res, phase, PP), key="vprof")
@@ -1892,9 +2093,53 @@ with tab_der:
     st.caption("О 18:00 (вечірній пік) PV не виробляє, тому саме АБ визначають, чи зможе частина мережі "
                "працювати в острівному режимі. Налаштування ВДЕ - у бічній панелі.")
 
+# ─────────────────────────── TAB: ВІННИЦЬКА ОБЛАСТЬ ───────────────────────────
+with tab_obl:
+    st.subheader("Вінницька область: умови на завтра по районах")
+    ow, o_src, o_date = oblast_weather(DAY_KEY)
+    cold = ow.loc[ow["tmin"].idxmin()]
+    peak = ow.loc[ow["peak_mw"].idxmax()]
+    m = st.columns(4)
+    m[0].metric("Дата", o_date)
+    m[1].metric("Найхолодніший район", str(cold["district"]), f"{cold['tmin']:.1f} °C", delta_color="off")
+    m[2].metric("Макс. пік типової мережі", f"{peak['peak_mw']:.1f} МВт", str(peak["district"]), delta_color="off")
+    m[3].metric("PV: середній потенціал", f"{ow['pv_yield'].mean():.2f} кВт·год/кВт")
+    Sc, mkey = _map_cls()
+    fo = go.Figure()
+    sel_r = ow[ow["district"] == district]
+    fo.add_trace(Sc(lon=sel_r["lon"], lat=sel_r["lat"], mode="markers", hoverinfo="skip", showlegend=False,
+                    marker=dict(size=38, color="#6a1b9a", opacity=0.35)))
+    span = max(ow["peak_mw"].max() - ow["peak_mw"].min(), 1e-6)
+    fo.add_trace(Sc(
+        lon=ow["lon"], lat=ow["lat"], mode="markers+text", text=ow["district"], textposition="top center",
+        showlegend=False, hoverinfo="text",
+        hovertext=[f"{r.district}<br>T: {r.tmin:.1f} … {r.tmax:.1f} °C<br>Пік типової мережі: {r.peak_mw:.1f} МВт<br>"
+                   f"PV: {r.pv_yield:.2f} кВт·год/кВт" for r in ow.itertuples()],
+        marker=dict(size=[16 + 14 * (v - ow["peak_mw"].min()) / span for v in ow["peak_mw"]],
+                    color=ow["tmin"], colorscale="RdYlBu", reversescale=True,
+                    colorbar=dict(title="T мін, °C", thickness=12, len=0.6))))
+    fo.update_layout(height=520, margin=dict(l=0, r=0, t=0, b=0),
+                     **{mkey: dict(style="open-street-map", center=dict(lat=OBLAST_CENTER[0], lon=OBLAST_CENTER[1]),
+                                   zoom=6.9)})
+    st.plotly_chart(fo, key="oblast_map")
+    st.caption("Колір - мінімальна температура завтра, розмір - пік навантаження типової мережі (за температурою, "
+               f"статична модель), фіолетове кільце - обраний район ({district}). Джерело: {o_src}.")
+    otbl = ow[["district", "tmin", "tmax", "peak_factor", "peak_mw", "pv_yield"]].copy()
+    otbl.insert(0, "Обрано", ["◀" if d == district else "" for d in otbl["district"]])
+    otbl.columns = ["Обрано", "Район", "T мін, °C", "T макс, °C", "Коеф. піку", "Пік типової мережі, МВт",
+                    "PV, кВт·год/кВт"]
+    st.dataframe(otbl.sort_values("T мін, °C"), hide_index=True, column_config={
+        "T мін, °C": st.column_config.NumberColumn(format="%.1f"),
+        "T макс, °C": st.column_config.NumberColumn(format="%.1f"),
+        "Коеф. піку": st.column_config.NumberColumn(format="%.2f"),
+        "Пік типової мережі, МВт": st.column_config.NumberColumn(format="%.1f"),
+        "PV, кВт·год/кВт": st.column_config.NumberColumn(format="%.2f")})
+    st.caption("Електрична мережа в застосунку умовна й однакова для всіх районів; відрізняються розташування, "
+               "погода й сонячна радіація. Для реальних розрахунків підключіть дані ГІС/SCADA вашого РЕМ.")
+
 # ─────────────────────────── TAB: ПРОГНОЗ НАВАНТАЖЕННЯ ───────────────────────────
 with tab_fc:
-    st.subheader("ML-прогноз добового графіка навантаження на завтра (LightGBM + Open-Meteo)")
+    st.subheader(f"ML-прогноз навантаження на завтра · {district} (LightGBM + Open-Meteo)")
     if FC is None:
         st.error(f"Прогноз недоступний: {FC_ERR}")
     else:
@@ -1923,6 +2168,8 @@ with tab_fc:
                           yaxis_title="МВт", yaxis2=dict(title="°C", overlaying="y", side="right"),
                           legend=dict(orientation="h", y=-0.2), title=f"Навантаження мережі на {FC['date']}")
         st.plotly_chart(fig, key="fc_chart")
+        st.caption(f"PV: {FC['pv_src']}; потенціал доби ≈ {sum(FC['pv_frac']):.1f} кВт·год/кВт встановленої. "
+                   f"Район: {district} ({lat:.2f}° пн. ш., {lon:.2f}° сх. д.).")
         st.caption(f"Модель: **{FC['model']}**, навчальних годин: {FC['n_train']}. Погода: {FC['weather_src']}. "
                    f"Історія навантаження: {FC['data_src']}. Ознаки: година, день тижня, температура, "
                    "ковзні середні T за 3/24 год, градуси холоду/спеки.")
@@ -1998,7 +2245,7 @@ with tab_live:
         cm_ = st.columns([2, 1, 2, 1, 1])
         host = cm_[0].text_input("Брокер", "broker.hivemq.com")
         port = int(cm_[1].number_input("Порт", 1, 65535, 1883))
-        prefix = cm_[2].text_input("Префікс топіків", "grid-twin-demo-CHANGE-ME",
+        prefix = cm_[2].text_input("Префікс топіків", "vinnytsia-twin-demo-CHANGE-ME",
                                    help="Публічні брокери бачать усі; задайте унікальний префікс і той самий у --prefix генератора")
         mq_user = cm_[3].text_input("Логін", "")
         mq_pwd = cm_[4].text_input("Пароль", "", type="password")
