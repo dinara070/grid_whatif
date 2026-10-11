@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Генератор синтетичної телеметрії для цифрового двійника мережі 10 кВ.
+Генератор синтетичної телеметрії для цифрового двійника мережі 10 кВ (Вінницька область).
 
 Імітує RTU/SCADA: кожні --interval секунд публікує в MQTT JSON-повідомлення по кожному
 трансформатору (2 ПС + 20 ТП): струм, завантаження, температуру масла та обмотки, напругу.
 Час у генераторі «віртуальний» (прискорений): кожен тік = --vstep хвилин, тому добовий цикл
 навантаження видно за кілька хвилин.
 
-Топіки:   <prefix>/telemetry/<ID активу>      напр.  grid-twin/telemetry/ТП-103
+Топіки:   <prefix>/telemetry/<ID активу>      напр.  vinnytsia-twin/telemetry/ТП-103
           <prefix>/control                    команди {"cmd":"inject","asset":"ТП-103","kind":"overload|cooling","ticks":12} / {"cmd":"clear"}
 Запуск:
     pip install paho-mqtt numpy
-    python telemetry_generator.py --host broker.hivemq.com --prefix grid-twin-<ваш_унікальний_суфікс>
+    python telemetry_generator.py --host broker.hivemq.com --prefix vinnytsia-twin-<ваш_унікальний_суфікс>
     python telemetry_generator.py --dry-run          # без брокера, лише друк у консоль
 
 УВАГА: публічні брокери (hivemq, mosquitto.org) бачать усі; задайте унікальний --prefix.
@@ -108,7 +108,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="localhost")
     ap.add_argument("--port", type=int, default=1883)
-    ap.add_argument("--prefix", default="grid-twin")
+    ap.add_argument("--prefix", default="vinnytsia-twin")
     ap.add_argument("--user", default="")
     ap.add_argument("--password", default="")
     ap.add_argument("--interval", type=float, default=2.0, help="пауза між тіками, с")
