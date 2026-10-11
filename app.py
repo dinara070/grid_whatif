@@ -8,7 +8,9 @@
      острівний режим (АБ формує мережу) під час аварії.
   3) Струми КЗ (pandapower.shortcircuit) і перевірка уставок релейного захисту
      (ТВ, МСЗ, вводи ПС), у т. ч. хибні спрацювання на резервних фідерах після перемикань.
-  4) Прогноз відмов обладнання (ML) та ризик = P × наслідки.
+  4) Прогноз відмов обладнання (ML + SHAP) та ризик = P × наслідки.
+  5) ML-прогноз навантаження на завтра (LightGBM + прогноз погоди Open-Meteo).
+  6) Телеметрія в реальному часі: MQTT (telemetry_generator.py) або вбудований симулятор.
 
 Запуск:  pip install -r requirements.txt  &&  streamlit run app.py
 
@@ -21,10 +23,19 @@
 runpp падає з "assignment destination is read-only").
 """
 import copy
+import io
+import json
 import logging
 import math
+import random
+import threading
+import time
+import urllib.parse
+import urllib.request
 import warnings
 from collections import defaultdict, deque, namedtuple
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import networkx as nx
 import numpy as np
@@ -33,9 +44,33 @@ import pandapower as pp
 import pandapower.shortcircuit as sc
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.ensemble import GradientBoostingClassifier
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from sklearn.ensemble import GradientBoostingClassifier, HistGradientBoostingRegressor
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
+
+try:
+    import shap
+    HAS_SHAP = True
+except Exception:                                   # noqa: BLE001
+    HAS_SHAP = False
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except Exception:                                   # noqa: BLE001
+    HAS_LGB = False
+try:
+    import paho.mqtt.client as mqtt
+    HAS_MQTT = True
+except Exception:                                   # noqa: BLE001
+    HAS_MQTT = False
+try:
+    from telemetry_generator import Simulator       # той самий симулятор, що й в окремому скрипті
+    HAS_SIM = True
+except Exception:                                   # noqa: BLE001
+    HAS_SIM = False
 
 warnings.filterwarnings("ignore")
 logging.getLogger("pandapower").setLevel(logging.ERROR)
@@ -58,7 +93,7 @@ SOC_FLOOR, BESS_EFF = 0.10, 0.92
 Params = namedtuple(
     "Params",
     "temp hour sens src_cap tol t_detect t_switch repair_h vmin vmax u_ps cosphi "
-    "der pv_k ins bess_mode soc island")
+    "der pv_k ins bess_mode soc island prof")
 
 PV_DEF = {"ТП-102": 0.5, "ТП-105": 0.4, "ТП-203": 0.6, "ТП-302": 0.5, "ТП-404": 0.5, "ТП-405": 0.7}
 BESS_DEF = {"ТП-104": (1.0, 2.0), "ТП-304": (1.2, 2.4), "ТП-404": (1.5, 3.0)}   # МВт, МВт·год
@@ -130,6 +165,9 @@ def temp_factor(temp, sens):
 
 
 def load_scale(p):
+    """Коефіцієнт навантаження: ML-профіль на завтра (p.prof, 24 значення) або статичний HOURLY × T."""
+    if p.prof:
+        return p.prof[int(p.hour)]
     return HOURLY[int(p.hour)] * temp_factor(p.temp, p.sens)
 
 
@@ -695,7 +733,8 @@ def scan_all(P):
 
 @st.cache_data(show_spinner="Побудова карти чутливості…")
 def sens_grid(P, elements, hours, temps):
-    return [[solve((float(t), int(h)) + tuple(P[2:]), elements)["unsup_mw"] for h in hours] for t in temps]
+    return [[solve((float(t), int(h)) + tuple(P[2:-1]) + ((),), elements)["unsup_mw"] for h in hours]
+            for t in temps]
 
 
 @st.cache_data(show_spinner="Розрахунок доби (24 режими pandapower)…")
@@ -743,7 +782,7 @@ def head_of(topo, node):
 
 @st.cache_data(show_spinner="Розрахунок уставок захисту…")
 def protection_settings(P):
-    p = Params(*P)._replace(temp=-20.0, hour=18, der=0)
+    p = Params(*P)._replace(temp=-20.0, hour=18, der=0, prof=())
     net = new_net(p)
     topo = topology(set(CLOSED0), E0, E0)
     stt = pp_state(net, p, topo, set(CLOSED0), E0, E0, load_scale(p), set(), set(), ())
@@ -1093,8 +1132,9 @@ def static_registry():
 STATIC_DF = static_registry()
 
 
-def registry_features(P, growth, winter_days):
-    """Завантаження активів беремо з pandapower (номінальний режим без ВДЕ), далі масштабуємо."""
+def registry_features(P, growth, winter_days, tel=None):
+    """Завантаження активів беремо з pandapower (номінальний режим без ВДЕ), далі масштабуємо.
+    tel - узагальнена live-телеметрія {актив: dict(peak, mean, frac_over, n)}: перекриває розрахункові значення."""
     p0 = Params(*P)._replace(der=0)
     net = new_net(p0)
     topo = topology(set(CLOSED0), E0, E0)
@@ -1107,13 +1147,26 @@ def registry_features(P, growth, winter_days):
             nominal.append(stt["src"].get(r["id"], 0.0))
         else:
             nominal.append(stt["ratio"].get(r["id"], 0.0))
-    peak = np.array(nominal) * temp_factor(p0.temp, p0.sens) * (1 + growth)
-    prof = np.array(HOURLY)
+    if p0.prof:                                     # ML-профіль на завтра
+        pf = np.array(p0.prof)
+        peak_k, prof = float(pf.max()), pf / pf.max()
+    else:
+        peak_k, prof = temp_factor(p0.temp, p0.sens), np.array(HOURLY)
+    peak = np.array(nominal) * peak_k * (1 + growth)
     df = STATIC_DF.copy()
     df["loading_peak"] = peak
     df["loading_mean"] = peak * prof.mean()
     df["overload_hours"] = winter_days * ((peak[:, None] * prof[None, :]) > 1.0).sum(axis=1)
     df["cold_hours"] = (winter_days * 24 * df["u"]).round()
+    df["from_telemetry"] = False
+    if tel:
+        for i, r in df.iterrows():
+            t = tel.get(r["id"])
+            if t and t["n"] >= 20:
+                df.at[i, "loading_peak"] = t["peak"]
+                df.at[i, "loading_mean"] = t["mean"]
+                df.at[i, "overload_hours"] = t["frac_over"] * 24 * winter_days
+                df.at[i, "from_telemetry"] = True
     for k in ("tp", "ps", "line"):
         df[f"is_{k}"] = (df["kind"] == k).astype(int)
     df["type"] = df["id"].map(elem_type)
@@ -1132,6 +1185,442 @@ def explain(model, row, ref):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# 7b. ML-ПРОГНОЗ НАВАНТАЖЕННЯ НА ЗАВТРА (LightGBM + прогноз погоди Open-Meteo)
+# ════════════════════════════════════════════════════════════════════════════
+OM_FC_URL = "https://api.open-meteo.com/v1/forecast"
+OM_AR_URL = "https://archive-api.open-meteo.com/v1/archive"
+FC_FEATS = ["hour", "hour_sin", "hour_cos", "dow", "is_wkend", "temp", "t3", "t24", "cold", "heat"]
+TOTAL_BASE_MW = sum(NODES[n]["load"] for n in TPS)       # навантаження мережі при коефіцієнті = 1.0
+
+
+def _om_get(url, params, timeout=8):
+    full = url + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(full, headers={"User-Agent": "grid-twin-demo/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _om_series(js):
+    h = js["hourly"]
+    return pd.Series(h["temperature_2m"], index=pd.to_datetime(h["time"]), dtype=float)
+
+
+def synth_weather(start, end, seed=3):
+    """Синтетична температура (запасний варіант, якщо Open-Meteo недоступний)."""
+    idx = pd.date_range(start, end, freq="h")
+    seasonal = 8.0 - 14.0 * np.cos(2 * np.pi * (idx.dayofyear.values - 15) / 365.0)
+    daily = 4.0 * np.sin(2 * np.pi * (idx.hour.values - 9) / 24.0)
+    rng = np.random.default_rng(seed)
+    noise = np.zeros(len(idx))
+    for i in range(1, len(idx)):
+        noise[i] = 0.985 * noise[i - 1] + rng.normal(0, 0.6)
+    return pd.Series(seasonal + daily + noise, index=idx)
+
+
+@st.cache_data(ttl=3600, show_spinner="Завантаження погоди (Open-Meteo)…")
+def get_weather(lat, lon, day_key):
+    """Годинна температура: архів ERA5 (≈14 міс.) + прогноз на 3 доби. Повертає (ряд, джерело, часовий пояс)."""
+    today = pd.Timestamp(day_key)
+    try:
+        fcj = _om_get(OM_FC_URL, dict(latitude=lat, longitude=lon, hourly="temperature_2m",
+                                      past_days=10, forecast_days=3, timezone="auto"))
+        s_fc, tz = _om_series(fcj), fcj.get("timezone", "Europe/Kyiv")
+    except Exception as ex:                          # noqa: BLE001
+        s = synth_weather(today - pd.Timedelta(days=420), today + pd.Timedelta(days=3))
+        return s, f"синтетична погода (Open-Meteo недоступний: {type(ex).__name__})", "UTC"
+    try:
+        arj = _om_get(OM_AR_URL, dict(latitude=lat, longitude=lon, hourly="temperature_2m", timezone="auto",
+                                      start_date=(today - pd.Timedelta(days=420)).strftime("%Y-%m-%d"),
+                                      end_date=(today - pd.Timedelta(days=11)).strftime("%Y-%m-%d")), timeout=20)
+        s_ar, src = _om_series(arj), "Open-Meteo: архів ERA5 + прогноз"
+    except Exception:                                # noqa: BLE001
+        s_ar = synth_weather(s_fc.index[0] - pd.Timedelta(days=420), s_fc.index[0] - pd.Timedelta(hours=1))
+        src = "Open-Meteo: прогноз (історія температур синтетична)"
+    s = pd.concat([s_ar, s_fc])
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s = s.asfreq("h").interpolate(limit=12).ffill().bfill()
+    return s, src, tz
+
+
+def _true_load(idx, temp):
+    """Синтетична «істинна» поведінка: профіль доби × вихідні × холод/спека (для демо-історії)."""
+    h, dow = idx.hour.values, idx.dayofweek.values
+    base = np.asarray(HOURLY)[h]
+    wk = np.where(dow == 5, 0.93, np.where(dow == 6, 0.88, 1.0))
+    morning = np.where((dow >= 5) & (h >= 6) & (h <= 10), 0.94, 1.0)
+    return (base * wk * morning * (1 + 0.012 * np.maximum(0, 5 - temp))
+            * (1 + 0.008 * np.maximum(0, temp - 24)))
+
+
+def _fc_features(ser):
+    d = pd.DataFrame({"temp": ser})
+    h = ser.index.hour
+    d["hour"] = h
+    d["hour_sin"], d["hour_cos"] = np.sin(2 * np.pi * h / 24), np.cos(2 * np.pi * h / 24)
+    d["dow"] = ser.index.dayofweek
+    d["is_wkend"] = (d["dow"] >= 5).astype(int)
+    d["t3"] = ser.rolling(3, min_periods=1).mean()
+    d["t24"] = ser.rolling(24, min_periods=1).mean()
+    d["cold"] = np.maximum(0, 5 - ser)
+    d["heat"] = np.maximum(0, ser - 24)
+    return d
+
+
+def _make_reg():
+    if HAS_LGB:
+        return lgb.LGBMRegressor(n_estimators=400, learning_rate=0.05, num_leaves=31, min_child_samples=20,
+                                 subsample=0.8, subsample_freq=1, colsample_bytree=0.9, random_state=0,
+                                 verbose=-1), "LightGBM"
+    return HistGradientBoostingRegressor(max_iter=400, learning_rate=0.05, random_state=0), "HistGradientBoosting (sklearn)"
+
+
+def _read_hist(raw, hist_idx):
+    """CSV (ts, load_mw; крок будь-який) -> коефіцієнт навантаження на сітці годин hist_idx."""
+    dfh = pd.read_csv(io.BytesIO(raw))
+    cols = {c.lower().strip(): c for c in dfh.columns}
+    tcol = next((cols[k] for k in ("ts", "timestamp", "time", "datetime") if k in cols), None)
+    lcol = next((cols[k] for k in ("load_mw", "load", "p_mw") if k in cols), None)
+    if tcol is None or lcol is None:
+        raise ValueError("потрібні стовпці ts та load_mw")
+    s = pd.Series(pd.to_numeric(dfh[lcol], errors="coerce").values, index=pd.to_datetime(dfh[tcol]))
+    s = s.dropna().sort_index().resample("h").mean() / TOTAL_BASE_MW
+    y = s.reindex(hist_idx).dropna()
+    if len(y) < 24 * 21:
+        raise ValueError("потрібно щонайменше 21 добу даних, що перетинаються з погодою")
+    return y
+
+
+@st.cache_data(ttl=3600, show_spinner="Навчання моделі прогнозу навантаження…")
+def forecast_load(lat, lon, day_key, hist_bytes=None):
+    ser, w_src, tz = get_weather(lat, lon, day_key)
+    try:
+        now_loc = pd.Timestamp(datetime.now(ZoneInfo(tz)).replace(tzinfo=None))
+    except Exception:                                # noqa: BLE001
+        now_loc = pd.Timestamp(datetime.now(ZoneInfo("UTC")).replace(tzinfo=None))
+    t_idx = pd.date_range(now_loc.normalize() + pd.Timedelta(days=1), periods=24, freq="h")
+    if not set(t_idx).issubset(set(ser.index)):
+        raise ValueError("у погодних даних немає всіх 24 годин завтрашньої доби")
+    feats = _fc_features(ser)
+    hist_idx = ser.index[ser.index <= now_loc.floor("h")]
+    y, d_src = None, "синтетична історія навантаження (демо)"
+    if hist_bytes:
+        try:
+            y = _read_hist(hist_bytes, hist_idx)
+            d_src = f"ваш CSV ({len(y)} год)"
+        except Exception as ex:                      # noqa: BLE001
+            d_src = f"синтетична історія (CSV не підійшов: {ex})"
+    if y is None:
+        rng = np.random.default_rng(5)
+        noise = np.zeros(len(hist_idx))
+        for i in range(1, len(noise)):
+            noise[i] = 0.9 * noise[i - 1] + rng.normal(0, 0.012)
+        y = pd.Series(_true_load(hist_idx, ser.loc[hist_idx].values) * (1 + noise), index=hist_idx)
+    X = feats.loc[y.index, FC_FEATS]
+    cut = y.index[-1] - pd.Timedelta(days=14)
+    tr, te = y.index <= cut, y.index > cut
+    m_cv, name = _make_reg()
+    m_cv.fit(X[tr], y[tr])
+    pred_te = m_cv.predict(X[te])
+    yt = y[te].values
+    stat_te = (np.asarray(HOURLY)[X.loc[te, "hour"].astype(int).values]
+               * (1 + 0.012 * np.maximum(0, 5 - X.loc[te, "temp"].values)))
+    m, _ = _make_reg()
+    m.fit(X, y)
+    Xt = feats.loc[t_idx, FC_FEATS]
+    prof = np.clip(m.predict(Xt), 0.2, 2.5)
+    stat = np.asarray(HOURLY) * (1 + 0.012 * np.maximum(0, 5 - Xt["temp"].values))
+    k = min(96, len(yt))
+    return dict(
+        date=t_idx[0].strftime("%d.%m.%Y"), tz=tz, weather_src=w_src, data_src=d_src, model=name, n_train=int(len(y)),
+        mae_ml=float(np.mean(np.abs(pred_te - yt))), mae_static=float(np.mean(np.abs(stat_te - yt))),
+        mape_ml=float(100 * np.mean(np.abs(pred_te - yt) / np.maximum(yt, 1e-6))),
+        profile=[float(v) for v in prof], static_profile=[float(v) for v in stat],
+        temps=[float(v) for v in Xt["temp"].values],
+        bt=dict(ts=[t.strftime("%Y-%m-%d %H:%M") for t in y[te].index[-k:]], actual=[float(v) for v in yt[-k:]],
+                ml=[float(v) for v in pred_te[-k:]], static=[float(v) for v in stat_te[-k:]]))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7c. EXPLAINABLE AI: SHAP
+# ════════════════════════════════════════════════════════════════════════════
+UA_NAMES = [FEAT_UA[f] for f in FEATURES]
+
+
+@st.cache_resource(show_spinner="Побудова SHAP-пояснювача…")
+def get_shap(df):
+    model = get_model(df)[0]
+    bg = df[FEATURES].sample(min(100, len(df)), random_state=0)
+    smp = df[FEATURES].sample(min(1000, len(df)), random_state=1)
+    ex_p = shap.TreeExplainer(model, data=bg, feature_perturbation="interventional", model_output="probability")
+    sv = shap.TreeExplainer(model)(smp)                  # log-odds, швидко - для summary-графіків
+    return ex_p, smp, sv
+
+
+def shap_row(ex_p, x_row):
+    """SHAP для одного активу, у відсоткових пунктах річної імовірності відмови."""
+    e = ex_p(x_row)
+    return shap.Explanation(values=e.values[0] * 100, base_values=float(np.ravel(e.base_values)[0]) * 100,
+                            data=x_row.values[0], feature_names=UA_NAMES)
+
+
+def fig_waterfall(e):
+    plt.close("all")
+    shap.plots.waterfall(e, max_display=10, show=False)
+    f = plt.gcf()
+    f.set_size_inches(9, 5)
+    return f
+
+
+def fig_summary(sv, smp, bar=False):
+    plt.close("all")
+    shap.summary_plot(sv.values, smp.values, feature_names=UA_NAMES, plot_type="bar" if bar else "dot",
+                      show=False, max_display=11)
+    f = plt.gcf()
+    f.set_size_inches(9, 5)
+    return f
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7d. ПОТІК ТЕЛЕМЕТРІЇ: вбудований генератор або MQTT (telemetry_generator.py)
+# ════════════════════════════════════════════════════════════════════════════
+@st.cache_resource
+def _store_registry():
+    return {}
+
+
+class LiveStore:
+    """Кільцеві буфери телеметрії по активах. Джерело: потік-симулятор (builtin) або MQTT-підписка."""
+
+    def __init__(self, mode, host, port, prefix, user, pwd, interval, vstep, ambient, maxlen=300):
+        self.key = (mode, host, int(port), prefix, user, pwd, float(interval), float(vstep))
+        self.mode, self.host, self.port = mode, host, int(port)
+        self.prefix = prefix.strip("/")
+        self.user, self.pwd, self.interval, self.vstep = user, pwd, float(interval), float(vstep)
+        self.ambient, self.maxlen = float(ambient), maxlen
+        self.buf, self.lock, self.stop_ev = {}, threading.Lock(), threading.Event()
+        self.arrivals = deque(maxlen=3000)
+        self.n_msgs, self.error, self.connected = 0, "", False
+        self.client = self.sim = self.thread = None
+
+    # ---- запуск / зупинка ----
+    def start(self):
+        if self.mode == "mqtt":
+            self._start_mqtt()
+        else:
+            self._start_builtin()
+
+    def stop(self):
+        self.stop_ev.set()
+        if self.client is not None:
+            try:
+                self.client.loop_stop()
+                self.client.disconnect()
+            except Exception:                        # noqa: BLE001
+                pass
+        self.connected = False
+
+    def _start_builtin(self):
+        self.sim = Simulator(self.ambient, 1.2, None, float(datetime.now().hour), self.vstep)
+        for _ in range(40):                          # прогрів теплової моделі
+            self.sim.tick()
+        self.sim.vt = datetime.now().hour * 60.0
+        self.connected = True
+
+        def loop():
+            while not self.stop_ev.is_set():
+                self.sim.ambient = self.ambient
+                for m in self.sim.tick():
+                    self.ingest(m)
+                self.stop_ev.wait(self.interval)
+        self.thread = threading.Thread(target=loop, daemon=True)
+        self.thread.start()
+
+    def _start_mqtt(self):
+        try:
+            c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        except AttributeError:                       # paho-mqtt 1.x
+            c = mqtt.Client()
+        if self.user:
+            c.username_pw_set(self.user, self.pwd)
+        topic = f"{self.prefix}/telemetry/#"
+
+        def on_connect(cl, ud, flags, rc, *a):
+            fail = getattr(rc, "is_failure", None)
+            ok = (not fail) if fail is not None else (rc == 0)
+            self.connected = bool(ok)
+            if ok:
+                cl.subscribe(topic, qos=0)
+                self.error = ""
+            else:
+                self.error = f"MQTT: брокер відхилив підключення ({rc})"
+
+        def on_disconnect(cl, ud, *a):
+            self.connected = False
+
+        def on_message(cl, ud, msg):
+            try:
+                self.ingest(json.loads(msg.payload.decode("utf-8")))
+            except Exception:                        # noqa: BLE001
+                pass
+        c.on_connect, c.on_disconnect, c.on_message = on_connect, on_disconnect, on_message
+        c.reconnect_delay_set(1, 10)
+        try:
+            c.connect_async(self.host, self.port, keepalive=30)
+            c.loop_start()
+        except Exception as ex:                      # noqa: BLE001
+            self.error = f"MQTT: {type(ex).__name__}: {ex}"
+        self.client = c
+
+    # ---- дані ----
+    def ingest(self, m):
+        a = m.get("asset")
+        if not a:
+            return
+        m = dict(m)
+        m["rx"] = time.time()
+        with self.lock:
+            self.buf.setdefault(a, deque(maxlen=self.maxlen)).append(m)
+            self.n_msgs += 1
+            self.arrivals.append(m["rx"])
+
+    def latest(self):
+        with self.lock:
+            rows = [dict(b[-1]) for b in self.buf.values() if b]
+        return pd.DataFrame(rows)
+
+    def frame(self, assets):
+        with self.lock:
+            rows = [m for a in assets for m in self.buf.get(a, [])]
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df["t"] = pd.to_datetime(df["rx"], unit="s")
+        return df
+
+    def status(self):
+        now = time.time()
+        with self.lock:
+            rate = sum(1 for t in self.arrivals if now - t <= 10.0) / 10.0
+            n = self.n_msgs
+        return dict(connected=self.connected, n=n, rate=rate)
+
+    def summary(self):
+        """Узагальнення для моделі відмов: {актив: peak, mean, frac_over, n} за вікном буфера."""
+        out = {}
+        with self.lock:
+            for a, b in self.buf.items():
+                v = [float(m.get("loading", 0.0)) for m in b]
+                if v:
+                    out[a] = dict(peak=max(v), mean=sum(v) / len(v),
+                                  frac_over=sum(1 for x in v if x > 1.0) / len(v), n=len(v))
+        return out
+
+    # ---- керування аномаліями ----
+    def inject(self, asset, kind, ticks=12):
+        if self.mode == "builtin" and self.sim is not None:
+            self.sim.events[asset] = (kind, int(ticks))
+        elif self.client is not None:
+            self.client.publish(f"{self.prefix}/control", json.dumps(
+                dict(cmd="inject", asset=asset, kind=kind, ticks=int(ticks)), ensure_ascii=False))
+
+    def clear(self):
+        if self.mode == "builtin" and self.sim is not None:
+            self.sim.events.clear()
+        elif self.client is not None:
+            self.client.publish(f"{self.prefix}/control", json.dumps(dict(cmd="clear")))
+
+
+def get_store(mode, host, port, prefix, user, pwd, interval, vstep, ambient):
+    reg = _store_registry()
+    key = (mode, host, int(port), prefix.strip("/"), user, pwd, float(interval), float(vstep))
+    cur = reg.get("store")
+    if cur is not None and cur.key == key:
+        return cur
+    if cur is not None:
+        cur.stop()
+    cur = LiveStore(mode, host, port, prefix, user, pwd, interval, vstep, ambient)
+    cur.start()
+    reg["store"] = cur
+    return cur
+
+
+def stop_store():
+    cur = _store_registry().pop("store", None)
+    if cur is not None:
+        cur.stop()
+
+
+def _live_state(r):
+    if r["loading"] > 1.0 or r["oil_c"] > 95 or r["winding_c"] > 110:
+        return "🔴 Тривога"
+    if r["loading"] > 0.9 or r["oil_c"] > 85:
+        return "🟡 Увага"
+    return "🟢 Норма"
+
+
+@st.fragment(run_every=2)
+def live_panel(store, assets):
+    s = store.status()
+    lat_df = store.latest()
+    if lat_df.empty:
+        if store.error:
+            st.error(store.error)
+        elif store.mode == "mqtt":
+            st.info(f"Очікуємо дані: {store.host}:{store.port}, топік `{store.prefix}/telemetry/#`. "
+                    f"Запустіть генератор: `python telemetry_generator.py --host {store.host} "
+                    f"--port {store.port} --prefix {store.prefix}`")
+        else:
+            st.info("Очікуємо перші повідомлення…")
+        return
+    for col, dflt in (("vt", "-"), ("kind", "-"), ("i_rated_a", np.nan), ("p_mw", np.nan), ("u_kv", np.nan),
+                      ("winding_c", np.nan), ("oil_c", np.nan), ("loading", 0.0), ("i_a", np.nan)):
+        if col not in lat_df:
+            lat_df[col] = dflt
+    lat_df["Стан"] = lat_df.apply(_live_state, axis=1)
+    bad = lat_df[lat_df["Стан"].str.startswith("🔴")]
+    c = st.columns(5)
+    c[0].metric("Зв'язок", "є" if s["connected"] else "немає")
+    c[1].metric("Повідомлень", f"{s['n']:,}".replace(",", " "), f"{s['rate']:.1f} повід./с", delta_color="off")
+    c[2].metric("Віртуальний час", str(lat_df["vt"].iloc[0]))
+    imax = lat_df["oil_c"].idxmax()
+    c[3].metric("Макс. T масла", f"{lat_df.at[imax, 'oil_c']:.0f} °C", str(lat_df.at[imax, "asset"]), delta_color="off")
+    c[4].metric("Тривог", len(bad))
+    if len(bad):
+        st.error("🔴 Тривога: " + ", ".join(
+            f"{r.asset} (навантаження {r.loading:.0%}, масло {r.oil_c:.0f} °C)" for r in bad.itertuples()))
+    df = store.frame(assets)
+    if not df.empty:
+        f1 = go.Figure()
+        f2 = go.Figure()
+        for a in assets:
+            d = df[df["asset"] == a]
+            f1.add_trace(go.Scatter(x=d["t"], y=d["oil_c"], name=a, mode="lines"))
+            f2.add_trace(go.Scatter(x=d["t"], y=d["i_a"], name=a, mode="lines"))
+        f1.add_hline(y=95, line=dict(color="#d32f2f", dash="dash"), annotation_text="T масла 95 °C")
+        f1.add_hline(y=85, line=dict(color="#fb8c00", dash="dot"))
+        f1.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="°C",
+                         title="Температура верхніх шарів масла")
+        f2.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="А",
+                         title="Струм 10 кВ, А")
+        g1, g2 = st.columns(2)
+        g1.plotly_chart(f1, key="live_t")
+        g2.plotly_chart(f2, key="live_i")
+    show = lat_df.sort_values("loading", ascending=False)[
+        ["asset", "kind", "loading", "i_a", "i_rated_a", "oil_c", "winding_c", "u_kv", "p_mw", "Стан"]].copy()
+    show["loading"] *= 100
+    show.columns = ["Актив", "Тип", "Завантаження, %", "I, А", "I ном, А", "T масла, °C", "T обмотки, °C",
+                    "U, кВ", "P, МВт", "Стан"]
+    st.dataframe(show, hide_index=True, column_config={
+        "Завантаження, %": st.column_config.ProgressColumn(min_value=0, max_value=150, format="%.0f%%"),
+        "I, А": st.column_config.NumberColumn(format="%.0f"),
+        "I ном, А": st.column_config.NumberColumn(format="%.0f"),
+        "T масла, °C": st.column_config.NumberColumn(format="%.1f"),
+        "T обмотки, °C": st.column_config.NumberColumn(format="%.1f"),
+        "U, кВ": st.column_config.NumberColumn(format="%.2f"),
+        "P, МВт": st.column_config.NumberColumn(format="%.2f")})
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # 8. ІНТЕРФЕЙС
 # ════════════════════════════════════════════════════════════════════════════
 st.title("⚡ Цифровий двійник мережі 10 кВ: Power Flow, ВДЕ, КЗ та прогноз відмов")
@@ -1139,8 +1628,18 @@ st.caption("Демонстраційні синтетичні дані. 2 ПС 1
            "6 PV-станцій та 3 акумуляторні батареї. Режими рахує pandapower (Newton-Raphson).")
 
 with st.sidebar:
+    st.header("📈 Профіль навантаження")
+    prof_mode = st.radio("Джерело добового профілю", ["Статичний (HOURLY × T)", "ML-прогноз на завтра"],
+                         help="ML-режим: LightGBM + прогноз погоди Open-Meteo; година доби = година завтрашнього дня")
+    use_fc = prof_mode.startswith("ML")
+    with st.expander("Локація, погода та історія"):
+        lat = st.number_input("Широта, °", -90.0, 90.0, 49.04, 0.01)
+        lon = st.number_input("Довгота, °", -180.0, 180.0, 28.11, 0.01)
+        hist_up = st.file_uploader("CSV історії навантаження (ts, load_mw)", type="csv", key="hist_csv")
+        hist_bytes = hist_up.getvalue() if hist_up is not None else None
     st.header("⚙️ Умови режиму")
-    temp = st.slider("Температура повітря, °C", -30, 15, -10)
+    temp = st.slider("Температура повітря, °C", -30, 15, -10,
+                     help="У режимі «ML-прогноз» температуру береться з прогнозу погоди для обраної години")
     hour = st.slider("Година доби", 0, 23, 18)
     sens = st.slider("Температурна чутливість навантаження, %/°C", 0.0, 3.0, 1.2, 0.1)
     src_cap = st.number_input("Допустима потужність кожної ПС, МВт", 5.0, 40.0, 12.0, 0.5)
@@ -1161,13 +1660,26 @@ with st.sidebar:
     t_detect = st.number_input("Виявлення і локалізація, хв", 1.0, 60.0, 5.0, 1.0)
     t_switch = st.number_input("Час однієї комутації, хв", 1.0, 60.0, 4.0, 1.0)
     repair_h = st.number_input("Тривалість ремонту, год", 1.0, 72.0, 8.0, 0.5)
-    st.caption(f"Коефіцієнт навантаження: **{HOURLY[hour] * temp_factor(temp, sens):.2f}** · "
-               f"PV зараз: **{pv_profile(hour) * ins / 100:.0%}** від встановленої.")
+
+FC, FC_ERR = None, ""
+try:
+    FC = forecast_load(float(lat), float(lon), datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%d"), hist_bytes)
+except Exception as ex:                             # noqa: BLE001
+    FC_ERR = f"{type(ex).__name__}: {ex}"
+use_fc = bool(use_fc and FC is not None)
+if use_fc:
+    temp = int(round(FC["temps"][hour]))
 
 P = (float(temp), int(hour), float(sens), float(src_cap), tol / 100.0, float(t_detect), float(t_switch),
      float(repair_h), float(vmin), float(vmax), float(u_ps), float(cosphi), int(der), float(pv_k), float(ins),
-     0 if bess_mode_txt.startswith("Резерв") else 1, soc / 100.0, int(island))
+     0 if bess_mode_txt.startswith("Резерв") else 1, soc / 100.0, int(island),
+     tuple(FC["profile"]) if use_fc else ())
 PP = Params(*P)
+with st.sidebar:
+    st.caption(f"Коефіцієнт навантаження: **{load_scale(PP):.2f}** · T = **{temp:+d} °C** · "
+               f"PV зараз: **{pv_profile(hour) * ins / 100:.0%}** від встановленої.")
+    if FC_ERR:
+        st.warning(f"ML-прогноз недоступний ({FC_ERR}); використано статичний профіль.")
 
 # --- діагностика: якщо Power Flow не рахується (наприклад, несумісні версії pandas/pandapower) ---
 _chk = pp_state(new_net(PP), PP, topology(set(CLOSED0), E0, E0), set(CLOSED0), E0, E0,
@@ -1179,8 +1691,9 @@ if not _chk["conv"]:
     st.stop()
 
 tabs = st.tabs(["🔥 Сценарний симулятор", "⚡ КЗ та релейний захист", "☀️ ВДЕ та добовий режим",
-                "📚 Бібліотека протоколів N-1", "🔮 Прогноз відмов", "⚖️ Ризик = P × наслідки"])
-tab1, tab_kz, tab_der, tab2, tab3, tab4 = tabs
+                "📈 Прогноз навантаження", "📚 Бібліотека протоколів N-1", "📡 Телеметрія (live)",
+                "🔮 Прогноз відмов", "⚖️ Ризик = P × наслідки"])
+tab1, tab_kz, tab_der, tab_fc, tab2, tab_live, tab3, tab4 = tabs
 
 # ─────────────────────────── TAB 1: СИМУЛЯТОР ───────────────────────────
 with tab1:
@@ -1379,6 +1892,62 @@ with tab_der:
     st.caption("О 18:00 (вечірній пік) PV не виробляє, тому саме АБ визначають, чи зможе частина мережі "
                "працювати в острівному режимі. Налаштування ВДЕ - у бічній панелі.")
 
+# ─────────────────────────── TAB: ПРОГНОЗ НАВАНТАЖЕННЯ ───────────────────────────
+with tab_fc:
+    st.subheader("ML-прогноз добового графіка навантаження на завтра (LightGBM + Open-Meteo)")
+    if FC is None:
+        st.error(f"Прогноз недоступний: {FC_ERR}")
+    else:
+        prof_ml, prof_st, tmp = np.array(FC["profile"]), np.array(FC["static_profile"]), np.array(FC["temps"])
+        pk = int(prof_ml.argmax())
+        m = st.columns(5)
+        m[0].metric("Дата прогнозу", FC["date"])
+        m[1].metric("Пік навантаження", f"{prof_ml.max() * TOTAL_BASE_MW:.1f} МВт", f"о {pk}:00", delta_color="off")
+        m[2].metric("Температура (мін / макс)", f"{tmp.min():.0f} / {tmp.max():.0f} °C")
+        m[3].metric("MAE ML, коеф. (14 діб)", f"{FC['mae_ml']:.3f}",
+                    f"{FC['mae_ml'] - FC['mae_static']:+.3f} vs статична", delta_color="inverse")
+        m[4].metric("MAPE ML", f"{FC['mape_ml']:.1f}%")
+        if use_fc:
+            st.success("Симулятор і всі розрахунки використовують ML-профіль на завтра (температура береться з прогнозу).")
+        else:
+            st.info("Зараз активний статичний профіль. Оберіть «ML-прогноз на завтра» у бічній панелі, "
+                    "щоб підставити цей графік у розрахунки.")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=list(range(24)), y=prof_ml * TOTAL_BASE_MW, name="ML-прогноз",
+                                 line=dict(color="#6a1b9a", width=3)))
+        fig.add_trace(go.Scatter(x=list(range(24)), y=prof_st * TOTAL_BASE_MW, name="Статична модель (HOURLY × T)",
+                                 line=dict(color="#9e9e9e", dash="dash")))
+        fig.add_trace(go.Scatter(x=list(range(24)), y=tmp, name="Температура, °C", yaxis="y2",
+                                 line=dict(color="#1e88e5", dash="dot")))
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="Година",
+                          yaxis_title="МВт", yaxis2=dict(title="°C", overlaying="y", side="right"),
+                          legend=dict(orientation="h", y=-0.2), title=f"Навантаження мережі на {FC['date']}")
+        st.plotly_chart(fig, key="fc_chart")
+        st.caption(f"Модель: **{FC['model']}**, навчальних годин: {FC['n_train']}. Погода: {FC['weather_src']}. "
+                   f"Історія навантаження: {FC['data_src']}. Ознаки: година, день тижня, температура, "
+                   "ковзні середні T за 3/24 год, градуси холоду/спеки.")
+        if "синтетична" in FC["data_src"]:
+            st.warning("Історія навантаження синтетична (демо). Для реальної точності завантажте CSV зі SCADA "
+                       "(стовпці ts, load_mw) у бічній панелі: «Локація, погода та історія».")
+        with st.expander("Перевірка на останніх 14 добах (бектест)"):
+            bt = FC["bt"]
+            fb = go.Figure()
+            fb.add_trace(go.Scatter(x=bt["ts"], y=bt["actual"], name="Факт", line=dict(color="#455a64")))
+            fb.add_trace(go.Scatter(x=bt["ts"], y=bt["ml"], name="ML", line=dict(color="#6a1b9a")))
+            fb.add_trace(go.Scatter(x=bt["ts"], y=bt["static"], name="Статична", line=dict(color="#9e9e9e", dash="dash")))
+            fb.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="коеф. навантаження",
+                             title="Останні 96 годин тестового вікна")
+            st.plotly_chart(fb, key="fc_bt")
+        tdf = pd.DataFrame({"Година": range(24), "T, °C": tmp, "Коеф. ML": prof_ml,
+                            "Навантаження ML, МВт": prof_ml * TOTAL_BASE_MW, "Коеф. статичний": prof_st})
+        st.dataframe(tdf, hide_index=True, column_config={
+            "T, °C": st.column_config.NumberColumn(format="%.1f"),
+            "Коеф. ML": st.column_config.NumberColumn(format="%.3f"),
+            "Навантаження ML, МВт": st.column_config.NumberColumn(format="%.2f"),
+            "Коеф. статичний": st.column_config.NumberColumn(format="%.3f")})
+        st.download_button("⬇️ Прогноз (CSV)", tdf.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"load_forecast_{FC['date']}.csv", mime="text/csv")
+
 # ─────────────────────────── TAB 2: N-1 ───────────────────────────
 scan_df, prots = None, None
 with tab2:
@@ -1410,6 +1979,53 @@ with tab2:
                             scan_df.sort_values("ens_mwh", ascending=False)["id"], format_func=fmt_elem)
         st.dataframe(pd.DataFrame(prots[pick]).drop(columns="type"), hide_index=True)
 
+# ─────────────────────────── TAB: ТЕЛЕМЕТРІЯ LIVE ───────────────────────────
+with tab_live:
+    st.subheader("Телеметрія в реальному часі (імітація SCADA / IoT-потоку)")
+    st.caption("Паралельний скрипт `telemetry_generator.py` публікує в MQTT струми, температуру масла й обмоток та "
+               "напругу кожного трансформатора; застосунок підписується й оновлює графіки кожні 2 с. "
+               "Без брокера працює вбудований генератор того самого симулятора.")
+    cs = st.columns([1.4, 1, 1, 1])
+    src_txt = cs[0].radio("Джерело потоку", ["Вбудований генератор", "MQTT-брокер"], horizontal=True)
+    run_on = cs[1].toggle("Потік увімкнено", True)
+    is_mqtt = src_txt.startswith("MQTT")
+    interval, vstep = 1.0, 15.0
+    if not is_mqtt:
+        interval = cs[2].number_input("Пауза між тіками, с", 0.5, 10.0, 1.0, 0.5)
+        vstep = cs[3].number_input("Віртуальних хв/тік", 1.0, 60.0, 15.0, 1.0)
+    host, port, prefix, mq_user, mq_pwd = "", 1883, "", "", ""
+    if is_mqtt:
+        cm_ = st.columns([2, 1, 2, 1, 1])
+        host = cm_[0].text_input("Брокер", "broker.hivemq.com")
+        port = int(cm_[1].number_input("Порт", 1, 65535, 1883))
+        prefix = cm_[2].text_input("Префікс топіків", "grid-twin-demo-CHANGE-ME",
+                                   help="Публічні брокери бачать усі; задайте унікальний префікс і той самий у --prefix генератора")
+        mq_user = cm_[3].text_input("Логін", "")
+        mq_pwd = cm_[4].text_input("Пароль", "", type="password")
+    if not run_on:
+        stop_store()
+        st.info("Потік вимкнено.")
+    elif is_mqtt and not HAS_MQTT:
+        st.error("Не встановлено paho-mqtt (додайте `paho-mqtt>=2.0` у requirements.txt).")
+    elif (not is_mqtt) and not HAS_SIM:
+        st.error("Не знайдено telemetry_generator.py поруч з app.py (потрібен для вбудованого генератора).")
+    else:
+        store = get_store("mqtt" if is_mqtt else "builtin", host.strip(), port, prefix.strip(), mq_user, mq_pwd,
+                          interval, vstep, float(temp))
+        store.ambient = float(temp)
+        sel_live = st.multiselect("Активи на графіках", ["ПС-1", "ПС-2"] + TPS,
+                                  default=["ПС-1", "ТП-103", "ТП-404"], format_func=fmt_elem)
+        ci = st.columns([2, 2, 1, 1])
+        a_pick = ci[0].selectbox("Інжектувати аномалію на", ["ПС-1", "ПС-2"] + TPS, index=2, format_func=fmt_elem)
+        k_pick = ci[1].radio("Тип аномалії", ["Перевантаження", "Відмова охолодження"], horizontal=True)
+        ci[2].write("")
+        if ci[2].button("⚡ Інжектувати"):
+            store.inject(a_pick, "overload" if k_pick == "Перевантаження" else "cooling", 12)
+        ci[3].write("")
+        if ci[3].button("Скинути"):
+            store.clear()
+        live_panel(store, sel_live or ["ПС-1"])
+
 # ─────────────────────────── TAB 3: ПРОГНОЗ ВІДМОВ ───────────────────────────
 with tab3:
     st.subheader("Імовірність аварії обладнання до того, як станеться обрив")
@@ -1432,7 +2048,14 @@ with tab3:
             st.warning(f"Не вдалося прочитати файл: {ex}")
     model, auc, imp, ref = get_model(train_df)
 
-    reg = registry_features(P, growth / 100.0, wdays)
+    live_store = _store_registry().get("store")
+    use_tel = st.checkbox("Підставити живу телеметрію у ознаки (пік/середнє завантаження, години перевантаження)",
+                          value=False, disabled=live_store is None,
+                          help="Потрібен запущений потік на вкладці «Телеметрія (live)»")
+    tel = live_store.summary() if (use_tel and live_store is not None) else None
+    reg = registry_features(P, growth / 100.0, wdays, tel)
+    if tel:
+        st.caption(f"Живі дані використано для {int(reg['from_telemetry'].sum())} активів (≥ 20 вимірів у буфері).")
     reg["p_year"] = model.predict_proba(reg[FEATURES].astype(float))[:, 1]
     reg["p_h"] = 1 - (1 - reg["p_year"]) ** (horizon / 12.0)
     reg["cat"] = reg["p_year"].map(category)
@@ -1465,21 +2088,51 @@ with tab3:
         "Пік. завант., %": st.column_config.NumberColumn(format="%.0f"),
         "Індекс стану": st.column_config.NumberColumn(format="%.0f")})
 
-    st.markdown("#### 🔎 Чому ризик саме такий?")
+    st.markdown("#### 🔎 Чому ризик саме такий? (SHAP)")
     asset = st.selectbox("Актив", reg.sort_values("p_h", ascending=False)["id"], format_func=fmt_elem)
     row = reg[reg["id"] == asset].iloc[0]
-    ex = explain(model, row, ref)
-    fig2 = go.Figure(go.Bar(x=100 * ex.values, y=ex.index, orientation="h",
-                            marker_color=["#d32f2f" if v > 0 else "#43a047" for v in ex.values]))
-    fig2.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
-                       title="Внесок факторів у річну імовірність відмови (п.п. відносно «типового» активу)")
-    st.plotly_chart(fig2, key="expl")
-    with st.expander("Важливість ознак у моделі"):
-        imp2 = imp.rename(index=FEAT_UA).sort_values()
-        f3 = go.Figure(go.Bar(x=imp2.values, y=imp2.index, orientation="h"))
-        f3.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
-        st.plotly_chart(f3, key="imp")
-    st.caption("Модель: GradientBoostingClassifier. Завантаження активів беруться з розрахунку pandapower. "
+    shap_done = False
+    if HAS_SHAP:
+        try:
+            ex_p, smp, sv = get_shap(train_df)
+            x_row = row[FEATURES].astype(float).to_frame().T
+            e = shap_row(ex_p, x_row)
+            ca, cb = st.columns([3, 2])
+            fw = fig_waterfall(e)
+            ca.pyplot(fw, clear_figure=True)
+            plt.close(fw)
+            top3 = np.argsort(-np.abs(e.values))[:3]
+            cb.markdown(f"**{fmt_elem(asset)}**: річна імовірність відмови **{e.base_values + e.values.sum():.1f}%** "
+                        f"(у середньому по навчальній вибірці {e.base_values:.1f}%).")
+            cb.markdown("Найсильніше впливають:")
+            for i in top3:
+                cb.markdown(f"- {UA_NAMES[i]} = {e.data[i]:.2f}: **{e.values[i]:+.1f} п.п.**")
+            cb.caption("Waterfall: від середнього ризику до ризику цього активу; червоне - підвищує, синє - знижує. "
+                       "Значення SHAP у відсоткових пунктах річної імовірності.")
+            with st.expander("Загальна картина: SHAP summary (навчальна вибірка)"):
+                kind = st.radio("Вигляд", ["Beeswarm (розподіл впливу)", "Bar (середній |SHAP|)"], horizontal=True)
+                fs = fig_summary(sv, smp, bar=kind.startswith("Bar"))
+                st.pyplot(fs, clear_figure=True)
+                plt.close(fs)
+                st.caption("Вісь X - вплив на log-odds відмови. Кожна точка - один актив навчальної вибірки; "
+                           "колір - значення ознаки (червоне - високе).")
+            shap_done = True
+        except Exception as ex_:                     # noqa: BLE001
+            st.warning(f"SHAP недоступний ({type(ex_).__name__}: {ex_}); показано спрощене пояснення.")
+    if not shap_done:
+        ex = explain(model, row, ref)
+        fig2 = go.Figure(go.Bar(x=100 * ex.values, y=ex.index, orientation="h",
+                                marker_color=["#d32f2f" if v > 0 else "#43a047" for v in ex.values]))
+        fig2.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10),
+                           title="Внесок факторів у річну імовірність відмови (п.п. відносно «типового» активу)")
+        st.plotly_chart(fig2, key="expl")
+        with st.expander("Важливість ознак у моделі"):
+            imp2 = imp.rename(index=FEAT_UA).sort_values()
+            f3 = go.Figure(go.Bar(x=imp2.values, y=imp2.index, orientation="h"))
+            f3.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10))
+            st.plotly_chart(f3, key="imp")
+    st.caption("Модель: GradientBoostingClassifier + SHAP (TreeExplainer). Завантаження активів - з розрахунку pandapower "
+               "або з live-телеметрії. "
                "Імовірність за горизонт: 1 − (1 − p_рік)^(міс./12). Синтетична історія слугує лише демонстрацією.")
 
 # ─────────────────────────── TAB 4: РИЗИК ───────────────────────────
