@@ -1,71 +1,83 @@
-# -*- coding: utf-8 -*-
-"""Streamlit-інтерфейс цифрового двійника мережі 10 кВ (Вінницька область) - ЛИШЕ візуальна частина.
+import sys
+from pathlib import Path
 
-Уся обчислювальна логіка живе в пакеті gridcore (model, powerflow, protection, forecast, predictive,
-telemetry, report, service) і не залежить від Streamlit; той самий шар обслуговує FastAPI (api.py).
-
-Запуск:  streamlit run app.py          API:  uvicorn api:app --port 8000
-"""
-import numpy as np
-import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
-from gridcore import service
-from gridcore.model import (
-    ALL_ELEMS,
-    DISTRICTS,
-    EDGES,
-    OBLAST_CENTER,
-    Params,
-    SOURCES,
-    TPS,
-    fmt_elem,
-    load_scale,
-    make_params,
-    pv_frac)
-from gridcore.powerflow import (daily_profile, health_check, scan_all, sens_grid, solve_c)
-from gridcore.protection import (
-    K_N,
-    K_V,
-    K_ZAP,
-    SWITCH_BREAK_KA,
-    T_IN,
-    T_MSZ,
-    fault_report,
-    protection_settings)
-from gridcore.viz import (
-    PHASES,
-    STATUS_STYLE,
-    _map_cls,
-    close_fig,
-    draw_geo_map,
-    draw_map,
-    fig_summary,
-    fig_waterfall,
-    voltage_profile)
-from gridcore.predictive import (
-    CAT_COLOR,
-    FEATURES,
-    FEAT_UA,
-    HAS_SHAP,
-    UA_NAMES,
-    explain,
-    get_model,
-    get_shap,
-    make_training,
-    registry_features,
-    risk_register,
-    score_registry,
-    shap_row,
-    training_from_csv)
-from gridcore.forecast import (TOTAL_BASE_MW, forecast_load, oblast_weather)
-from gridcore.telemetry import (
-    HAS_MQTT,
-    classify_state,
-    current_store,
-    get_store,
-    stop_store)
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))                      # модулі проєкту шукаємо поруч з app.py
+
+try:
+    import numpy as np
+    import pandas as pd
+    import plotly.graph_objects as go
+
+    from gridcore import service
+    from gridcore.model import (
+        ALL_ELEMS,
+        DISTRICTS,
+        EDGES,
+        OBLAST_CENTER,
+        Params,
+        SOURCES,
+        TPS,
+        fmt_elem,
+        load_scale,
+        make_params,
+        pv_frac)
+    from gridcore.powerflow import (daily_profile, health_check, scan_all, sens_grid, solve_c)
+    from gridcore.protection import (
+        K_N,
+        K_V,
+        K_ZAP,
+        SWITCH_BREAK_KA,
+        T_IN,
+        T_MSZ,
+        fault_report,
+        protection_settings)
+    from gridcore.viz import (
+        PHASES,
+        STATUS_STYLE,
+        _map_cls,
+        close_fig,
+        draw_geo_map,
+        draw_map,
+        fig_summary,
+        fig_waterfall,
+        voltage_profile)
+    from gridcore.predictive import (
+        CAT_COLOR,
+        FEATURES,
+        FEAT_UA,
+        HAS_SHAP,
+        UA_NAMES,
+        explain,
+        get_model,
+        get_shap,
+        make_training,
+        registry_features,
+        risk_register,
+        score_registry,
+        shap_row,
+        training_from_csv)
+    from gridcore.forecast import (TOTAL_BASE_MW, forecast_load, oblast_weather)
+    from gridcore.telemetry import (
+        HAS_MQTT,
+        classify_state,
+        current_store,
+        get_store,
+        stop_store)
+except Exception as _err:                           # noqa: BLE001  (на Streamlit Cloud текст винятків приховується - показуємо самі)
+    st.set_page_config(page_title="Помилка завантаження", page_icon="⚠️", layout="wide")
+    st.error(f"**Не вдалося завантажити модулі застосунку:** `{type(_err).__name__}: {_err}`")
+    st.markdown(
+        "**Що перевірити**\n\n"
+        "1. У GitHub-репозиторії **поруч з `app.py`** мають лежати всі файли проєкту (папка `gridcore/` з усіма "
+        "`.py`-файлами або, у плоскому варіанті, файли `gc_*.py`) та `telemetry_generator.py`.\n"
+        "2. У `requirements.txt` мають бути всі залежності з архіву (`fpdf2`, `lightgbm`, `shap`, `paho-mqtt`, `pandas<3` …).\n"
+        "3. Після завантаження файлів натисніть **Manage app → Reboot app**.\n\n"
+        "Нижче - що зараз лежить поруч з `app.py` на сервері:")
+    st.code("\n".join(sorted(p.name + ("/" if p.is_dir() else "") for p in HERE.iterdir())), language="text")
+    st.stop()
 
 st.set_page_config(page_title="Цифровий двійник мережі 10 кВ: Вінницька область", page_icon="⚡", layout="wide")
 
