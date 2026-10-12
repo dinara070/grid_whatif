@@ -1,0 +1,3 @@
+-r requirements-api.txt
+pytest
+httpx               # TestClient для FastAPI
