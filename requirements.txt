@@ -11,3 +11,4 @@ shap
 matplotlib
 paho-mqtt>=2.0
 fpdf2>=2.7          # PDF-звіти
+gridcore
