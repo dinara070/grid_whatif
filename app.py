@@ -11,8 +11,8 @@ try:
     import pandas as pd
     import plotly.graph_objects as go
 
-    from gridcore import service
-    from gridcore.model import (
+    import gc_service as service
+    from gc_model import (
         ALL_ELEMS,
         DISTRICTS,
         EDGES,
@@ -24,8 +24,8 @@ try:
         load_scale,
         make_params,
         pv_frac)
-    from gridcore.powerflow import (daily_profile, health_check, scan_all, sens_grid, solve_c)
-    from gridcore.protection import (
+    from gc_powerflow import (daily_profile, health_check, scan_all, sens_grid, solve_c)
+    from gc_protection import (
         K_N,
         K_V,
         K_ZAP,
@@ -34,7 +34,7 @@ try:
         T_MSZ,
         fault_report,
         protection_settings)
-    from gridcore.viz import (
+    from gc_viz import (
         PHASES,
         STATUS_STYLE,
         _map_cls,
@@ -44,7 +44,7 @@ try:
         fig_summary,
         fig_waterfall,
         voltage_profile)
-    from gridcore.predictive import (
+    from gc_predictive import (
         CAT_COLOR,
         FEATURES,
         FEAT_UA,
@@ -59,8 +59,8 @@ try:
         score_registry,
         shap_row,
         training_from_csv)
-    from gridcore.forecast import (TOTAL_BASE_MW, forecast_load, oblast_weather)
-    from gridcore.telemetry import (
+    from gc_forecast import (TOTAL_BASE_MW, forecast_load, oblast_weather)
+    from gc_telemetry import (
         HAS_MQTT,
         classify_state,
         current_store,
