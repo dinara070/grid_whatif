@@ -1,4 +1,3 @@
-# --- застосунок (Streamlit) та обчислювальне ядро gridcore ---
 streamlit>=1.37
 pandapower>=3.1
 pandas<3            # pandapower < 3.2 несумісний з pandas 3.x (runpp: "assignment destination is read-only")
@@ -11,3 +10,6 @@ shap
 matplotlib
 paho-mqtt>=2.0
 fpdf2>=2.7          # PDF-звіти
+# --- необов'язково: лише для FastAPI (uvicorn app:api) ---
+# fastapi>=0.110
+# uvicorn[standard]
